@@ -7,14 +7,14 @@ require("dotenv").config();
 const app = express();
 app.use(express.json());
 
-// --------------------
-// CORS
-// --------------------
-const normalizeOrigin = (o) => (o ? String(o).trim().replace(/\/$/, "") : null);
+// Render está detrás de proxy (importante para headers/https)
+app.set("trust proxy", 1);
 
+// ===== CORS =====
 const allowedOrigins = new Set(
   [
-    normalizeOrigin(process.env.FRONTEND_ORIGIN), // EJ: https://fnc-coffee-gateway-np9a.vercel.app
+    process.env.FRONTEND_ORIGIN,                 // tu Vercel
+    "https://fnc-coffee-gateway-np9a.vercel.app",
     "http://localhost:5173",
     "http://localhost:5175",
     "http://127.0.0.1:5173",
@@ -25,8 +25,7 @@ const allowedOrigins = new Set(
 const corsOptions = {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true); // Postman/curl
-    const o = normalizeOrigin(origin);
-    if (allowedOrigins.has(o)) return cb(null, true);
+    if (allowedOrigins.has(origin)) return cb(null, true);
     return cb(new Error(`CORS bloqueado para: ${origin}`));
   },
   methods: ["GET", "POST", "OPTIONS"],
@@ -37,45 +36,34 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 
-// --------------------
-// DB (Neon / Postgres)
-// --------------------
+// ===== DB (Neon/Postgres) =====
 if (!process.env.DATABASE_URL) {
   console.warn("⚠️ Falta DATABASE_URL en variables de entorno (Render -> Environment).");
 }
 
-// Neon requiere SSL. Usamos rejectUnauthorized:false para evitar errores de certificado.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: { rejectUnauthorized: false }, // Neon requiere SSL
 });
 
-// --------------------
-// Roles válidos
-// --------------------
+// Roles válidos (deben coincidir con tu DB)
 const ROLES_VALIDOS = new Set(["Director", "CoordProyectos", "Financiera"]);
 
-// --------------------
 // Health
-// --------------------
 app.get("/health", async (_req, res) => {
   try {
     await pool.query("SELECT 1");
-    return res.json({ ok: true, db: true });
+    res.json({ ok: true, db: true });
   } catch (e) {
-    console.error("HEALTH_ERROR:", e?.message || e);
-    return res.status(500).json({ ok: false, db: false });
+    console.error("HEALTH_ERROR:", e);
+    res.status(500).json({ ok: false, db: false, error: "db_error" });
   }
 });
 
-// --------------------
 // Login
-// Body: { usuario, password }
-// --------------------
 app.post("/login", async (req, res) => {
   try {
     const { usuario, password } = req.body || {};
-    console.log("LOGIN_REQ:", { usuario, hasPassword: !!password });
 
     if (!usuario || !password) {
       return res.status(400).json({ message: "Faltan credenciales" });
@@ -83,7 +71,7 @@ app.post("/login", async (req, res) => {
 
     const userUpper = String(usuario).toUpperCase().trim();
 
-    const result = await pool.query(
+    const { rows } = await pool.query(
       `SELECT id, usuario, password_hash, rol, activo
        FROM public.usuarios
        WHERE usuario = $1
@@ -91,13 +79,13 @@ app.post("/login", async (req, res) => {
       [userUpper]
     );
 
-    if (result.rowCount === 0) {
+    if (!rows.length) {
       return res.status(401).json({ message: "Usuario o contraseña incorrectos" });
     }
 
-    const user = result.rows[0];
+    const user = rows[0];
 
-    // En Postgres activo es boolean
+    // activo en Postgres es boolean (true/false)
     if (user.activo !== true) {
       return res.status(401).json({ message: "Usuario inactivo" });
     }
@@ -114,22 +102,20 @@ app.post("/login", async (req, res) => {
       return res.status(403).json({ message: "Rol no autorizado" });
     }
 
-    await pool.query("UPDATE public.usuarios SET ultimo_login = NOW() WHERE id = $1", [
-      user.id,
-    ]);
+    await pool.query(
+      "UPDATE public.usuarios SET ultimo_login = NOW() WHERE id = $1",
+      [user.id]
+    );
 
     return res.json({ usuario: user.usuario, rol });
   } catch (e) {
-    console.error("LOGIN_ERROR:", e?.message || e);
+    console.error("LOGIN_ERROR:", e);
     return res.status(500).json({ message: "Error interno del servidor" });
   }
 });
 
-// --------------------
-// Listen (Render)
-// --------------------
+// Arranque
 const PORT = Number(process.env.PORT || 3001);
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, () => {
   console.log(`✅ Auth API corriendo en puerto ${PORT}`);
-  console.log("✅ FRONTEND_ORIGIN permitido:", normalizeOrigin(process.env.FRONTEND_ORIGIN));
 });
